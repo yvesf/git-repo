@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+GIT_REPO_ROOT=${GIT_REPO_ROOT:="/git"}
+GIT_SHARED_GROUP=${GIT_SHARED_GROUP:="share"}
+CLONE_SSH_PREFIX=${CLONE_SSH_PREFIX:="ssh://localnet.cc"}
+CLONE_HTTP_PREFIX=${CLONE_HTTP_PREFIX:="http://localnet.cc/cgit/cgit.cgi/"}
+
+C_bg_green=$(echo -e "\\e[42m")
+C_bg_magenta=$(echo -e "\\e[45m")
+C_bg_default=$(echo -e "\\e[49m")
+C_bg_lblue=$(echo -e "\\e[104m")
+
+_getent() {
+    local db=$1
+    local key=$2
+    getent "$db" "$key" | cut -d ':' -f 1
+}
+
+_list_repo_dirs() {
+    find "$1" -maxdepth 6 -type d -not -path '*.git/*' -name '*.git' 2>/dev/null
+}
+
+# shellcheck disable=SC2154
+do_list() {
+    local root_path
+    if [ -n "$1" ]; then
+	root_path=$(readlink -f "$1")
+    else
+	root_path=$GIT_REPO_ROOT
+    fi
+    echo -n "Working.. listing repositories under $root_path"
+    for repo_path in $(_list_repo_dirs $root_path | sort); do
+        echo -ne "\\r" # to remove "Working..."
+	eval "$(stat --format 'local repo_path_uid=%u repo_path_gid=%g repo_path_mode=%a' "$repo_path")"
+        if [ "$repo_path_uid" != "$UID" ]; then
+            # so there must be a matching gid
+            local pass=false
+            for user_gid in $(id -G); do
+                if [ "$repo_path_gid" == "$user_gid" ]; then
+                    pass=true
+                fi
+            done
+            if ! $pass; then
+                continue # skip that repo since uid and gids don't match
+            fi
+
+        fi
+	
+        local shortdesc permissions color
+	shortdesc=$(cut -c 1-40 < "$repo_path/description")
+	permissions="owner=$(_getent passwd "$repo_path_uid")"
+	color="$C_bg_green"
+        if [ $(( 0$repo_path_mode & 070 )) -gt 0 ]; then # shared
+	    permissions="$permissions group=$(_getent group "$repo_path_gid")"
+	    color="$C_bg_lblue"
+	fi
+        if [ $(( 0$repo_path_mode & 07 )) -gt 0 ]; then # public
+	    permissions="$permissions PUBLIC"
+            if ! [ -f "$repo_path/PUBLIC" ]; then
+                permissions="${permissions}-but-cgit-marker-file-missing"
+            fi
+	    color="$C_bg_magenta"
+	fi
+	printf "%s%-60s (%s) (%s)\\n" "$color" "$repo_path$C_bg_default" "$permissions" "$shortdesc"
+    done
+}
+
+_create_repo() {
+    local shared=$2
+    local group=$3
+    local is_public=$4
+
+    read -r -p 'New repository name.git: '
+    local repo_name=$REPLY
+
+    if ! expr "$repo_name" : '.*\.git' >/dev/null; then
+        echo "Repository name must end with .git"
+        return 1
+    fi
+
+    local repo_dir=$GIT_REPO_ROOT/$USER/${repo_name}
+
+    test \! -e "$repo_dir" || { echo "Repo $repo_dir already exist"; exit 1; }
+
+    read -r -p 'Set Description:         '
+    local repo_desc=$REPLY
+
+    read -r -p "Create $repo_name in $repo_dir Ok? (y/N)"
+    test "$REPLY" == "y" || exit 1
+
+    mkdir -p "$repo_dir"
+    git init -q --bare --shared="$shared" "$repo_dir"
+    GIT_DIR="$repo_dir" git config receive.denyNonFastforwards false
+    echo "$repo_desc" > "$repo_dir/description"
+
+    if [ -n "$group" ]; then
+	    chgrp -R "$group" "$repo_dir"
+	    find "$repo_dir" -type d -exec chmod g+s \{\} \;
+    fi
+
+    if $is_public; then
+	touch "$repo_dir/PUBLIC"
+	echo "created $repo_dir/PUBLIC to expose via cgit"
+    fi
+
+    echo "done creating $repo_name in $repo_dir"
+    echo "use 'git repo show $repo_dir' for details"
+    return 0
+}
+
+do_create_public() {
+    _create_repo "public repository" "0664" "$GIT_SHARED_GROUP" true
+    return $?
+}
+
+do_create_shared() {
+    _create_repo "group-writeable repository" "0660" "$GIT_SHARED_GROUP" false
+    return $?
+}
+
+do_create_private() {
+    _create_repo "private repository" "0600" "" false
+    return $?
+}
+
+do_show() {
+    local repo_file_mode repo_file_uid repo_file_user repo_file_gid repo_file_group repo_git_shared
+    for repo_path in "$@"; do
+	if ! [ -f "$repo_path/HEAD" ]; then
+	    repo_path="$GIT_REPO_ROOT/$repo_path"
+	fi
+        if ! [ -f "$repo_path/HEAD" ]; then
+            echo "Not a git repository: $repo_path"
+            continue
+        fi
+        repo_file_mode=$(stat --format %a "$repo_path")
+        repo_file_uid=$(stat --format %u "$repo_path")
+        repo_file_user=$(_getent passwd "$repo_file_uid")
+        repo_file_gid=$(stat --format %g "$repo_path")
+        repo_file_group=$(_getent group "$repo_file_gid")
+        repo_git_shared=$(GIT_DIR="$repo_path" git config --get core.sharedrepository)
+
+	echo "  Directory: $repo_path"
+        echo "  ✔ Permissions mode ${repo_file_mode} (uid=${repo_file_uid}/${repo_file_user} gid=${repo_file_gid}/${repo_file_group})"
+	echo "    git core.sharedrepository=$repo_git_shared"
+        echo " ⚡ Clone read/write SSH: git clone '${CLONE_SSH_PREFIX}${repo_path}'"
+        if [ $(( 0$repo_file_mode & 07 )) -gt 0 ]; then
+	    echo "    Clone read/-  HTTP:   git clone '${CLONE_HTTP_PREFIX}${repo_path#"$GIT_REPO_ROOT/"}'"
+	fi
+	echo "    Update remote:        git remote set-url origin '${CLONE_SSH_PREFIX}${repo_path}"
+        echo "  ☛ To update description execute: $EDITOR $repo_path/description"
+	echo ""
+    done
+}
+
+do_mirror() {
+    local root_path is_mirror
+    root_path=$(readlink -f "$1")
+    for repo_path in $(_list_repo_dirs "$root_path"); do
+	is_mirror=$(GIT_DIR="$repo_path" git config --get remote.origin.mirror)
+	if [ "$is_mirror" != "true" ]; then
+	    continue # skip non-mirror repo
+	fi
+	echo "Mirror $repo_path from $(GIT_DIR="$repo_path" git config --get remote.origin.url)"
+	GIT_DIR="$repo_path" git fetch --force --prune origin
+    done
+}
+
+_do_make() {
+    local repo_path=$1
+    local repo_file_mode=$2
+    local repo_dir_mode=$3
+    local repo_is_public=$4
+    test -f "$repo_path/HEAD" || { echo "$repo_path is not a git repository"; exit 1; }
+    git init -q --bare --shared="$repo_file_mode" "$repo_path"
+    find "$repo_path" -type d -exec chown "$USER:$GIT_SHARED_GROUP" \{\} \;
+    find "$repo_path" -type d -exec chmod "$repo_dir_mode" \{\} \;
+    find "$repo_path" -type f -exec chmod "$repo_file_mode" \{\} \;
+    if $repo_is_public; then
+	touch "$repo_path/PUBLIC"
+    else
+	rm -f "$repo_path/PUBLIC"
+    fi
+    do_list "$repo_path"
+}
+
+do_make_public() {
+    _do_make "$1" 0664 2775 true
+}
+
+do_make_shared() {
+    _do_make "$1" 0660 2770 false
+}
+
+do_make_private() {
+    _do_make "$1" 0600 0700 false
+}
+
+do_help() {
+    cat <<HERE
+Subcommands of git repo:
+  list [<dir>]        List infos (optional: only below <dir>)
+  show <dir...>       Show Commands for repo <dir>
+  mirror <dir>        Mirror git repositories under <dir> by looking
+                      for 'remote.origin.mirror = true' config flag.
+		      Also set: 'fetch = +refs/*:refs/*'
+  create-public       Create new repository that is
+                        - Read/Write by Owner
+                        - Read/Write by '${GIT_SHARED_GROUP}' group.
+                        - Read-Only through www via cgit
+  create-shared       Create new repository that is
+                        - Read/Write by Owner
+                        - Read/Write by '${GIT_SHARED_GROUP}' group.
+  create-private      Create new repository that is
+                        - Read/Write by Owner only
+  make-public <dir>   Change permissions to public
+  make-shared <dir>   Change permissions to shared
+  make-private <dir>  Change permissions to private
+
+
+  ☛ Base directory of repositories: $GIT_REPO_ROOT
+  ☛ Color codes: ${C_bg_magenta}public${C_bg_default}, ${C_bg_lblue}shared${C_bg_default}, ${C_bg_green}private${C_bg_default}
+  ☛ For limited ssh-access with current user configure ~/.ssh/authorized_keys with:
+      command=\"git shell -c \\\"\$SSH_ORIGINAL_COMMAND\\\"\",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-rsa AAAAB3.....
+HERE
+}
+
+case "$1" in
+    list) do_list "$2" ;;
+    create-public) do_create_public ;;
+    create-shared) do_create_shared ;;
+    create-private) do_create_private ;;
+    make-public) do_make_public "$2" ;;
+    make-shared) do_make_shared "$2" ;;
+    make-private) do_make_private "$2" ;;
+    show)
+        shift
+        do_show "$@"
+        ;;
+    mirror) do_mirror "$2" ;;
+    help)
+	do_help
+	;;
+    *)
+        cat <<HERE
+Unknown subcommand: '$1'
+HERE
+	do_help
+        ;;
+esac
